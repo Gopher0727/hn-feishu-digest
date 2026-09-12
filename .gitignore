@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+work/
+.DS_Store
+.venv/
+logs/
+.tmux-sockets/
+state/work-cache/
+state/reports/
+state/diagnostics/
+state/last-ids.json
+state/backlog.json
