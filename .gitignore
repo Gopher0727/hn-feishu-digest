@@ -13,3 +13,8 @@ state/reports/
 state/diagnostics/
 state/last-ids.json
 state/backlog.json
+
+data/
+state-collector/
+state-company/
+state/pipeline.lock

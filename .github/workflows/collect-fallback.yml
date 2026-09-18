@@ -1,0 +1,36 @@
+name: HN collection fallback
+on:
+  schedule:
+    # Beijing 09:07, 10:07, 11:07, 12:07; before consumer compensation slots.
+    - cron: '7 1-4 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: hn-source-collection
+  cancel-in-progress: false
+jobs:
+  collect:
+    if: vars.PUSH_MODE == 'company' && vars.DATA_REPO != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      PUSH_MODE: company
+      TASK_ROLE: collector
+      DATA_REPO: ${{ vars.DATA_REPO }}
+      DATA_TOKEN: ${{ secrets.DATA_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Collect only if today's package is missing
+        run: python local_scheduler.py --once
+      - name: Preserve diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: collection-diagnostics-${{ github.run_id }}
+          path: state/diagnostics/
+          retention-days: 7
+          if-no-files-found: ignore

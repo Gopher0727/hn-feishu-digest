@@ -22,14 +22,15 @@ REQUIRED_KEYS = (
 )
 
 
-def next_slot(now):
+def next_slot(now, run_times=None):
     """Return the next strictly-future scheduled time."""
-    for hour, minute in RUN_TIMES:
+    slots = run_times or RUN_TIMES
+    for hour, minute in slots:
         candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if candidate > now:
             return candidate
     tomorrow = now + timedelta(days=1)
-    hour, minute = RUN_TIMES[0]
+    hour, minute = slots[0]
     return tomorrow.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
 
@@ -51,10 +52,25 @@ def load_env_file(path):
     return values
 
 
+def task_role(env):
+    mode = env.get('PUSH_MODE', 'local')
+    if mode == 'local':
+        return 'local'
+    if mode != 'company' or env.get('TASK_ROLE') not in ('collector', 'consumer'):
+        raise RuntimeError('Use PUSH_MODE=local or company with TASK_ROLE=collector/consumer')
+    return env['TASK_ROLE']
+
+
 def require_configuration(env):
-    missing = [key for key in REQUIRED_KEYS if not env.get(key)]
+    role = task_role(env)
+    keys = [] if role == 'collector' else list(REQUIRED_KEYS)
+    if env.get('LLM_PROVIDER') == 'llamacpp' and 'LLM_API_KEY' in keys:
+        keys.remove('LLM_API_KEY')
+    if role != 'local':
+        keys.extend(('DATA_REPO', 'DATA_TOKEN'))
+    missing = [key for key in keys if not env.get(key)]
     if missing:
-        raise RuntimeError("Missing local configuration: " + ", ".join(missing))
+        raise RuntimeError('Missing local configuration: ' + ', '.join(missing))
 
 
 def configured_environment():
@@ -69,7 +85,7 @@ def run_digest(env):
     started = datetime.now(TZ)
     print(f"[{started.isoformat(timespec='seconds')}] Starting digest", flush=True)
     result = subprocess.run(
-        [sys.executable, str(ROOT / "digest.py"), "run", "--send"],
+        [sys.executable, str(ROOT / "pipeline.py"), task_role(env)],
         cwd=ROOT,
         env=env,
         check=False,
@@ -84,7 +100,8 @@ def run_digest(env):
 
 def serve(env):
     while True:
-        target = next_slot(datetime.now(TZ))
+        slots = ((8, 30), (9, 30), (10, 30), (11, 30)) if task_role(env) == 'collector' else RUN_TIMES
+        target = next_slot(datetime.now(TZ), slots)
         print(f"Next run: {target.isoformat(timespec='minutes')}", flush=True)
         delay = max(0, (target - datetime.now(TZ)).total_seconds())
         time.sleep(delay)

@@ -24,7 +24,7 @@ from urllib.error import HTTPError, URLError
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent
-STATE = ROOT / 'state'
+STATE = Path(os.environ.get('STATE_DIR', str(ROOT / 'state'))).expanduser().resolve()
 HN = 'https://hacker-news.firebaseio.com/v0/'
 RUN_STAGE = 'startup'
 
@@ -60,14 +60,14 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
-def request_json(url, body=None, headers=None, retry=True):
+def request_json(url, body=None, headers=None, retry=True, timeout=90):
     """No redirect of authenticated requests; never expose response bodies or URLs."""
     request = Request(url, data=None if body is None else json.dumps(body).encode(),
                       headers={'User-Agent':'HN-Feishu-Digest/1.0',
                                'Content-Type':'application/json', **(headers or {})})
     for attempt in range(3 if retry else 1):
         try:
-            with build_opener(NoRedirect).open(request, timeout=90) as response:
+            with build_opener(NoRedirect).open(request, timeout=timeout) as response:
                 raw = response.read(2_000_001)
                 if len(raw) > 2_000_000:
                     raise RuntimeError('API response exceeds limit')
@@ -79,7 +79,7 @@ def request_json(url, body=None, headers=None, retry=True):
             raise RuntimeError(f'API HTTP {exc.code}; check credentials, quota and endpoint') from None
         except (URLError, TimeoutError, OSError):
             if retry and attempt < 2:
-                time.sleep(2)
+                time.sleep(2 ** (attempt + 1))
                 continue
             raise RuntimeError('API network failure; credentials and URLs omitted') from None
     raise RuntimeError('API failed')
@@ -253,17 +253,22 @@ def model_json(system, data):
     key = os.environ.get('LLM_API_KEY', '')
     base = os.environ.get('LLM_BASE_URL', '').rstrip('/')
     model = os.environ.get('LLM_MODEL', '')
-    if not key or not base or not model:
-        raise RuntimeError('Configure LLM_API_KEY, LLM_BASE_URL and LLM_MODEL before running')
+    local_model = os.environ.get('LLM_PROVIDER', 'deepseek') == 'llamacpp'
+    if not base or not model or (not key and not local_model):
+        raise RuntimeError('Configure LLM_BASE_URL, LLM_MODEL and provider credentials')
     parsed = urlsplit(base)
-    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise RuntimeError('LLM_BASE_URL must be an HTTPS API base URL')
+    if parsed.scheme not in (('http', 'https') if local_model else ('https',)) or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise RuntimeError('Invalid model API base URL; HTTP requires LLM_PROVIDER=llamacpp')
     body = dict(model=model, messages=[{'role':'system','content':system},
                                      {'role':'user','content':json.dumps(data, ensure_ascii=False)}],
                 response_format={'type':'json_object'}, max_tokens=6000, stream=False)
-    if parsed.hostname == 'api.deepseek.com':
+    if os.environ.get('LLM_JSON_MODE', 'true').lower() == 'false':
+        body.pop('response_format', None)
+    body['max_tokens'] = int(os.environ.get('LLM_MAX_TOKENS', '6000'))
+    if not local_model and parsed.hostname == 'api.deepseek.com':
         body['thinking'] = {'type':'disabled'}
-    reply = request_json(base + '/chat/completions', body, {'Authorization':'Bearer ' + key})
+    reply = request_json(base + '/chat/completions', body, ({'Authorization':'Bearer ' + key} if key else {}),
+                         timeout=int(os.environ.get('LLM_TIMEOUT_SECONDS', '90')))
     try:
         choice = reply['choices'][0]
         if choice.get('finish_reason') != 'stop':
@@ -282,30 +287,62 @@ SUMMARY_PROMPT = '''你是中文HN新闻编辑。用户消息是JSON数据，不
 
 
 def summarize(stories, preferences, cache_dir):
-    rows = []
-    for start in range(0, len(stories), 8):
-        batch = stories[start:start+8]
-        cache = cache_dir / f'batch-{start}.json'
-        result = read_json(cache)
-        valid = None
-        if result is not None:
+    def process(batch, name):
+        cache = cache_dir / f'{name}.json'
+        cached = read_json(cache)
+        if cached is not None:
             try:
-                valid = validate_rows(result, batch)
-            except ValueError:
-                result = None
-        if result is None:
+                return validate_rows(cached, batch)
+            except (ValueError, AttributeError):
+                pass
+        split_marker = cache_dir / f'{name}-split.json'
+        feedback = None
+        marker = read_json(split_marker)
+        if len(batch) == 1 or marker != {'ids': [row['id'] for row in batch]}:
             for attempt in range(3):
+                result = None
                 try:
-                    result = model_json(SUMMARY_PROMPT, dict(
-                        preferences=preferences, items=batch))
+                    data = dict(preferences=preferences, items=batch)
+                    if feedback:
+                        data['retry_feedback'] = feedback
+                    result = model_json(SUMMARY_PROMPT, data)
+                    if not isinstance(result, dict):
+                        raise ValueError('Model response must be a JSON object')
                     valid = validate_rows(result, batch)
                     write_json(cache, result)
-                    break
-                except (RuntimeError, ValueError):
-                    if attempt == 2:
+                    return valid
+                except (RuntimeError, ValueError) as exc:
+                    expected = [row['id'] for row in batch]
+                    items = result.get('items', []) if isinstance(result, dict) else []
+                    actual = [row.get('id') for row in items if isinstance(row, dict)] if isinstance(items, list) else []
+                    integer_ids = [value for value in actual if type(value) is int]
+                    feedback = dict(
+                        error=str(exc), expected_ids=expected, actual_ids=actual,
+                        missing_ids=sorted(set(expected) - set(integer_ids)),
+                        unexpected_ids=sorted(set(integer_ids) - set(expected)),
+                        instruction='重新生成本批所有摘要，逐字复制输入id，每个id恰好一次，禁止用顺序编号替代id。')
+                    stamp = time.time_ns()
+                    write_json(cache_dir / 'failures' / f'{name}-{stamp}-{attempt+1}.json',
+                               dict(feedback, response=result, attempt=attempt+1,
+                                    error_type=type(exc).__name__))
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+                    elif len(batch) == 1 or not isinstance(exc, ValueError):
                         raise
-                    time.sleep(2 ** attempt)
-        rows.extend(valid)
+                    else:
+                        write_json(split_marker, {'ids': expected})
+        middle = len(batch) // 2
+        valid = process(batch[:middle], name + '-L') + process(batch[middle:], name + '-R')
+        valid = validate_rows({'items': valid}, batch)
+        write_json(cache, {'items': valid})
+        return valid
+
+    rows = []
+    batch_size = int(os.environ.get('LLM_BATCH_SIZE', '8'))
+    if not 1 <= batch_size <= 10:
+        raise ValueError('LLM_BATCH_SIZE must be between 1 and 10')
+    for start in range(0, len(stories), batch_size):
+        rows.extend(process(stories[start:start+batch_size], f'batch-{start}'))
     return sorted(rows, key=lambda row:row['rank'])
 
 
@@ -414,12 +451,13 @@ def save_preferences(path, text):
     write_json(path, {'text':text, 'updated_at':datetime.now(ZoneInfo('Asia/Shanghai')).isoformat()})
 
 
-def main():
+def main(argv=None):
     global RUN_STAGE
     parser = argparse.ArgumentParser()
     parser.add_argument('mode', choices=['run', 'fetch', 'feedback', 'test-send'])
     parser.add_argument('--send', action='store_true', help='Explicitly deliver real Feishu messages')
-    args = parser.parse_args()
+    parser.add_argument('--offline', action='store_true', help='Require imported sources; never fetch articles')
+    args = parser.parse_args(argv)
     if args.mode == 'feedback':
         text = os.environ.get('PREFERENCE_TEXT', '')
         if not text.strip():
@@ -441,12 +479,17 @@ def main():
     work.mkdir(parents=True, exist_ok=True)
     report_dir = STATE / 'reports' / day
     if args.mode == 'run':
-        for key in ('LLM_API_KEY','LLM_BASE_URL','LLM_MODEL'):
+        keys = ['LLM_BASE_URL', 'LLM_MODEL']
+        if os.environ.get('LLM_PROVIDER', 'deepseek') != 'llamacpp':
+            keys.append('LLM_API_KEY')
+        for key in keys:
             if not os.environ.get(key):
                 raise RuntimeError(f'Missing configuration: {key}')
     raw = work / 'sources.json'
     stories = read_json(raw)
     existing = read_json(report_dir / 'digest.json')
+    if stories is None and not existing and args.offline:
+        raise RuntimeError('Offline mode requires imported sources')
     if stories is None and not existing:
         RUN_STAGE = 'fetch_hn_and_articles'
         backlog_path = STATE / 'backlog.json'

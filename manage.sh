@@ -20,7 +20,7 @@ case "${1:-}" in
       exit 0
     fi
     tmux new-session -d -s "$SESSION" -c "$PROJECT_DIR" \
-      "exec env UV_CACHE_DIR='$UV_CACHE_DIR' caffeinate -dimsu uv run python local_scheduler.py >> '$LOG_FILE' 2>&1"
+      "exec env UV_CACHE_DIR='$UV_CACHE_DIR' caffeinate -is uv run python local_scheduler.py >> '$LOG_FILE' 2>&1"
     sleep 1
     if tmux has-session -t "$SESSION" 2>/dev/null; then
       echo "Scheduler started: $SESSION"

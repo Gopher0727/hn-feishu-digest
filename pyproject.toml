@@ -3,4 +3,4 @@ name = "hn-feishu-digest"
 version = "0.1.0"
 description = "Local Hacker News digest delivered to Feishu"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["tzdata; sys_platform == 'win32'"]

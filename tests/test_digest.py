@@ -160,6 +160,43 @@ class DigestTests(unittest.TestCase):
         self.assertEqual(calls[-1], [17, 18])
         self.assertEqual(len(calls), 4)
 
+    def test_failed_batches_split_and_resume_completed_children(self):
+        stories = self.sample(4)
+        fail = True
+        def model(prompt, data):
+            items = data['items']
+            if len(items) > 1 or (fail and items[0]['id'] == 3):
+                return {'items': [dict(row, id=999) for row in items]}
+            return {'items': items}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(digest, 'model_json', side_effect=model), patch.object(digest.time, 'sleep'):
+            root = Path(tmp)
+            with self.assertRaises(ValueError):
+                digest.summarize(stories, '', root)
+            self.assertTrue((root / 'batch-0-L-L.json').exists())
+            self.assertTrue((root / 'batch-0-L-R.json').exists())
+            failures = list((root / 'failures').glob('*.json'))
+            self.assertTrue(failures)
+            event = json.loads(failures[0].read_text())
+            self.assertIn('expected_ids', event)
+            self.assertIn('actual_ids', event)
+            self.assertIn('response', event)
+            fail = False
+            rows = digest.summarize(stories, '', root)
+            self.assertEqual([row['id'] for row in rows], [1, 2, 3, 4])
+            with patch.object(digest, 'model_json', side_effect=AssertionError('cache not reused')):
+                self.assertEqual(digest.summarize(stories, '', root), rows)
+
+    def test_retry_contains_id_correction_and_keeps_failure_response(self):
+        stories = self.sample(2)
+        def model(prompt, data):
+            if 'retry_feedback' not in data:
+                return {'items': [dict(row, id=999) for row in stories]}
+            self.assertEqual(data['retry_feedback']['missing_ids'], [1, 2])
+            self.assertEqual(data['retry_feedback']['unexpected_ids'], [999])
+            return {'items': stories}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(digest, 'model_json', side_effect=model), patch.object(digest.time, 'sleep'):
+            self.assertEqual(len(digest.summarize(stories, '', Path(tmp))), 2)
+
     def test_digest_shows_seven_then_toggle_panel(self):
         rows = self.sample(15)
         card = digest.make_cards(rows, '2026-09-09', '', 0)[0]
